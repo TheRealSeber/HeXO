@@ -1,9 +1,10 @@
-//! HeXO Monte Carlo Tree Search. Pure UCB1 + uniform-random rollouts.
+//! HeXO Monte Carlo Tree Search.
 //!
-//! `choose_move` first runs a cheap tactical scan (catches 1-ply wins/blocks),
-//! then dispatches root-parallelized MCTS across all rayon worker threads. Each
-//! thread runs an independent tree; we aggregate root-child visit counts at the
-//! end and pick the most-visited move.
+//! `choose_move` first runs a cheap tactical scan (1- and 2-ply wins, blocks,
+//! and own setups), then dispatches root-parallelized MCTS across all rayon
+//! worker threads. Each thread runs an independent tree with biased rollouts
+//! (active player extends their own lines 80% of the time); we aggregate
+//! root-child visit counts at the end and pick the most-visited move.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,8 +54,8 @@ impl Mcts {
         }
         let root_player = state.current_player()?;
 
-        // Tactical preamble: catches 1-ply wins and 1-ply blocks BEFORE MCTS.
-        // Pure UCB1 + random rollouts misses these reliably at low iteration budgets and
+        // Tactical preamble: catches forced wins / setups / blocks BEFORE MCTS.
+        // Biased-rollout MCTS still misses these reliably at low iteration budgets and
         // sometimes even at high ones (HeXO's 2-stones-per-turn injects rollout noise).
         if let Some(mv) = find_immediate_tactical(state, root_player) {
             return Some(mv);
@@ -223,57 +224,117 @@ impl Node {
     }
 }
 
-/// Returns a tactically-forced move if one exists at the current state:
+/// Returns a tactically-forced move if one exists at the current state.
 ///
-/// 1. A move that wins immediately for the player to move.
-/// 2. Otherwise, a move that blocks an opponent's 1-ply forced win.
+/// Scan priority:
 ///
-/// This is a cheap scan over legal moves (~µs per move) that runs once per
-/// `choose_move` call to catch tactics MCTS rollouts miss at low iteration budgets.
+/// 1. **Win-in-1** — place a stone that completes `win_len`-in-a-row for me now.
+/// 2. **Win-in-2** — if I have ≥2 stones left this turn, place a stone that creates a
+///    `(win_len - 1)`-in-a-row with at least one same-side free extension. On my next
+///    call (same turn) the win-in-1 branch will finish it.
+/// 3. **Block opp's win-in-1** — opp would win on their next placement; block it.
+/// 4. **Block opp's win-in-2** — opp would create `(win_len - 1)` with same-side extension
+///    by playing here. We play it instead, neutralizing the setup. Repeat next call to
+///    block the other end of an open-4.
+///
+/// This is a cheap scan over legal moves (a few hundred µs total) that runs once per
+/// `choose_move` call to catch tactics pure MCTS rollouts miss at any iteration budget.
 fn find_immediate_tactical(state: &GameState, me: Player) -> Option<Coord> {
     let opp = me.opponent();
     let stones: std::collections::HashMap<Coord, Player> =
         state.placed_stones().into_iter().collect();
     let win_len = state.config().win_length as usize;
     let legal = state.legal_moves_set();
+    let moves_left = state.moves_remaining_this_turn();
 
-    if let Some(&c) = legal
-        .iter()
-        .find(|&&c| is_immediate_win_at(&stones, c, me, win_len))
+    let mut my_win: Option<Coord> = None;
+    let mut my_setup: Option<Coord> = None;
+    let mut opp_win: Option<Coord> = None;
+    let mut opp_setup: Option<Coord> = None;
+
+    for &c in legal.iter() {
+        if my_win.is_none() {
+            let (len, ext) = projected_line(&stones, legal, c, me);
+            if len >= win_len {
+                my_win = Some(c);
+            } else if my_setup.is_none() && len + 1 >= win_len && ext >= 1 {
+                my_setup = Some(c);
+            }
+        }
+        if opp_win.is_none() {
+            let (len, ext) = projected_line(&stones, legal, c, opp);
+            if len >= win_len {
+                opp_win = Some(c);
+            } else if opp_setup.is_none() && len + 1 >= win_len && ext >= 1 {
+                opp_setup = Some(c);
+            }
+        }
+        if my_win.is_some() && opp_win.is_some() && my_setup.is_some() && opp_setup.is_some() {
+            break;
+        }
+    }
+
+    if let Some(c) = my_win {
+        return Some(c);
+    }
+    if moves_left >= 2
+        && let Some(c) = my_setup
     {
         return Some(c);
     }
-    legal
-        .iter()
-        .find(|&&c| is_immediate_win_at(&stones, c, opp, win_len))
-        .copied()
+    if let Some(c) = opp_win {
+        return Some(c);
+    }
+    opp_setup
 }
 
-/// Would placing `player`'s stone at `c` complete a `win_len`-in-a-row along any of the 3 axes?
-fn is_immediate_win_at(
+/// If `player` were to place at `c`, what would be (1) the longest resulting line through
+/// `c` along any of the 3 win axes, and (2) the number of same-side legal-empty cells
+/// beyond that line that could extend it further on a subsequent move?
+fn projected_line(
     stones: &std::collections::HashMap<Coord, Player>,
+    legal: &std::collections::HashSet<Coord>,
     c: Coord,
     player: Player,
-    win_len: usize,
-) -> bool {
+) -> (usize, usize) {
     let axes: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
+    let mut best_len = 1usize;
+    let mut best_ext = 0usize;
+
     for &(dq, dr) in &axes {
-        let mut count = 1;
-        let mut p = (c.0 + dq, c.1 + dr);
-        while stones.get(&p) == Some(&player) {
-            count += 1;
-            p = (p.0 + dq, p.1 + dr);
+        // Forward: count adjacent `player` stones, then empty+legal cells beyond.
+        let mut fwd_run = 0usize;
+        let mut cursor = (c.0 + dq, c.1 + dr);
+        while stones.get(&cursor) == Some(&player) {
+            fwd_run += 1;
+            cursor = (cursor.0 + dq, cursor.1 + dr);
         }
-        let mut p = (c.0 - dq, c.1 - dr);
-        while stones.get(&p) == Some(&player) {
-            count += 1;
-            p = (p.0 - dq, p.1 - dr);
+        let mut fwd_free = 0usize;
+        while !stones.contains_key(&cursor) && legal.contains(&cursor) {
+            fwd_free += 1;
+            cursor = (cursor.0 + dq, cursor.1 + dr);
         }
-        if count >= win_len {
-            return true;
+        // Backward: same.
+        let mut bwd_run = 0usize;
+        let mut cursor = (c.0 - dq, c.1 - dr);
+        while stones.get(&cursor) == Some(&player) {
+            bwd_run += 1;
+            cursor = (cursor.0 - dq, cursor.1 - dr);
+        }
+        let mut bwd_free = 0usize;
+        while !stones.contains_key(&cursor) && legal.contains(&cursor) {
+            bwd_free += 1;
+            cursor = (cursor.0 - dq, cursor.1 - dr);
+        }
+
+        let len = fwd_run + bwd_run + 1;
+        let ext = fwd_free.max(bwd_free);
+        if len > best_len || (len == best_len && ext > best_ext) {
+            best_len = len;
+            best_ext = ext;
         }
     }
-    false
+    (best_len, best_ext)
 }
 
 /// Biased rollout to terminal. Returns +1 if root_player wins, 0 draw, -1 loss.
@@ -420,35 +481,33 @@ mod tests {
 
     #[test]
     fn mcts_blocks_opponent_immediate_win() {
-        // P2 has 3-in-row, it's P1's turn with 2 stones to play. P1 must block.
+        // P2 has open-3 at r=-2; with win_length=4 a single stone at either end
+        // completes the win. It's P1's turn with 2 stones. P1 must block.
+        //
+        // P1's stones are scattered so no pair sits on the same hex axis with a
+        // gap reachable in two placements — P1 has no win-in-2 setup, so the
+        // tactical scan can't find a my-win or my-setup and must defer to
+        // blocking opponent's immediate threat.
         //
         // Sequence (win_length=4):
         // 1. P1 (0,0) forced
-        // 2. P2 (-1,-2)
-        // 3. P2 (0,-2)            — P2 has 2-in-row at r=-2
-        // 4. P1 (3,0)
-        // 5. P1 (3,1)
-        // 6. P2 (1,-2)            — P2 has 3-in-row at r=-2: (-1,-2),(0,-2),(1,-2). One move left this turn.
-        //                           Need P2 to NOT yet win. Open ends: (-2,-2) and (2,-2).
-        //                           So P2 places its second move elsewhere.
-        // 7. P2 (4,0)             — P2 done. Now P1's turn.
+        // 2. P2 (-1,-2), (0,-2)        — 2 in a row at r=-2
+        // 3. P1 (-2, 3), (3, -3)       — wide-spread, not colinear with (0,0) on
+        //                                 any 4-in-a-row pathway in 2 stones
+        // 4. P2 (1,-2), (-3, -1)       — extends to open-3 + an unrelated filler
         let g = play(
             small(),
-            &[(-1, -2), (0, -2), (3, 0), (3, 1), (1, -2), (4, 0)],
+            &[(-1, -2), (0, -2), (-2, 3), (3, -3), (1, -2), (-3, -1)],
         );
         assert!(
             !g.is_terminal(),
             "setup terminated early; rewrite play sequence"
         );
         assert_eq!(g.current_player(), Some(Player::P1));
+        assert_eq!(g.moves_remaining_this_turn(), 2);
 
-        // Pure UCB1 + uniform-random rollouts has known limits on 2-ply tactical threats
-        // when combined with HeXO's 2-stones-per-turn rule (the same player gets to recover
-        // on their second stone, so first-stone choice has low signal in random rollouts).
-        // We bump iterations high here; if this still fails the test is marked as a known
-        // weakness rather than a bug.
         let mut mcts = Mcts::new(MctsConfig {
-            iterations: 100_000,
+            iterations: 5_000,
             exploration_c: std::f32::consts::SQRT_2,
             seed: Some(7),
         });
@@ -458,7 +517,7 @@ mod tests {
         let blocks = [(-2, -2), (2, -2)];
         assert!(
             blocks.contains(&mv),
-            "expected MCTS to block at one of {:?}, got {:?}",
+            "expected tactical scan to block opp's open-3 at one of {:?}, got {:?}",
             blocks,
             mv
         );
