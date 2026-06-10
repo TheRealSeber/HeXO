@@ -1,0 +1,10 @@
+[package]
+name = "ai"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hexo-engine = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rayon = { workspace = true }

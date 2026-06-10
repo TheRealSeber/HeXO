@@ -1,0 +1,14 @@
+[package]
+name = "app"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hexo"
+path = "src/main.rs"
+
+[dependencies]
+hexo-engine = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+ai = { path = "../ai" }
